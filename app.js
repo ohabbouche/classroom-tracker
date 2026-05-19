@@ -983,6 +983,8 @@ async function runGeneration() {
   };
 
   try {
+    // Fetch the existing file's SHA before saving — GitHub requires this when overwriting
+    await loadSavedReports(periodKey).catch(() => { S.savedReportsSha = null; });
     await persistReports(periodKey, reportData);
     showToast('✅ Reports saved!');
     S.savedReports = reportData;
