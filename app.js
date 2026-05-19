@@ -216,12 +216,9 @@ async function loadSavedReports(periodKey) {
 }
 
 async function persistReports(periodKey, data) {
-  S.savedReportsSha = await ghPut(
-    `data/reports/${periodKey}.json`,
-    data,
-    S.savedReportsSha,
-    `Reports ${periodKey}`
-  );
+  const path = `data/reports/${periodKey}.json`;
+  const { sha } = await ghGet(path);
+  S.savedReportsSha = await ghPut(path, data, sha, `Reports ${periodKey}`);
   S.savedReports = data;
 }
 
@@ -983,8 +980,6 @@ async function runGeneration() {
   };
 
   try {
-    // Fetch the existing file's SHA before saving — GitHub requires this when overwriting
-    await loadSavedReports(periodKey).catch(() => { S.savedReportsSha = null; });
     await persistReports(periodKey, reportData);
     showToast('✅ Reports saved!');
     S.savedReports = reportData;
