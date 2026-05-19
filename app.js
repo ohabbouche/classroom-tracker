@@ -258,13 +258,13 @@ function setSavePill(state) {
 
 // ─── CLAUDE API ────────────────────────────────────────────────────────────────
 async function callClaude(prompt) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const proxyUrl = S.settings.claudeProxyUrl || 'https://claude-proxy.omar-habbouche.workers.dev/';
+  const res = await fetch(proxyUrl, {
     method: 'POST',
     headers: {
       'x-api-key': S.settings.claudeKey,
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
-      'anthropic-dangerous-request-override': 'true',
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
@@ -473,6 +473,11 @@ function renderSetup() {
           <input type="password" id="s-claude" value="${esc(s.claudeKey || '')}" placeholder="sk-ant-xxxxxxxxxxxx" autocomplete="off">
           <div class="form-hint">Get a key at console.anthropic.com. Only used when generating end-of-term reports.</div>
         </div>
+        <div class="form-row">
+          <label>Cloudflare Proxy URL</label>
+          <input type="text" id="s-proxy" value="${esc(s.claudeProxyUrl || '')}" placeholder="https://claude-proxy.YOUR-NAME.workers.dev" autocomplete="off" autocapitalize="none">
+          <div class="form-hint">A free Cloudflare Worker that lets the app call the AI. See the setup guide (Step 6b).</div>
+        </div>
       </div>
 
       <button class="btn btn-primary" id="setup-save">Save &amp; Continue →</button>
@@ -489,13 +494,14 @@ function attachSetupEvents() {
     const owner = document.getElementById('s-owner').value.trim();
     const repo  = document.getElementById('s-repo').value.trim();
     const claude = document.getElementById('s-claude').value.trim();
+    const proxy  = document.getElementById('s-proxy').value.trim();
 
     if (!token || !owner || !repo || !claude) {
       showToast('Please fill in all fields');
       return;
     }
 
-    S.settings = { ...S.settings, ghToken: token, dataOwner: owner, dataRepo: repo, claudeKey: claude };
+    S.settings = { ...S.settings, ghToken: token, dataOwner: owner, dataRepo: repo, claudeKey: claude, claudeProxyUrl: proxy };
     saveSettingsToStorage();
 
     setView('loading');
@@ -1030,6 +1036,11 @@ function renderSettings() {
           <label>Anthropic API Key</label>
           <input type="password" id="cfg-claude" value="${esc(s.claudeKey || '')}" autocomplete="off">
         </div>
+        <div class="form-row">
+          <label>Cloudflare Proxy URL</label>
+          <input type="text" id="cfg-proxy" value="${esc(s.claudeProxyUrl || '')}" placeholder="https://claude-proxy.YOUR-NAME.workers.dev" autocomplete="off" autocapitalize="none">
+          <div class="form-hint">Required for report generation. See setup guide for how to create this.</div>
+        </div>
         <button class="btn btn-primary" id="save-cfg" style="margin-top:4px;">Save Changes</button>
       </div>
 
@@ -1118,8 +1129,9 @@ function attachSettingsEvents() {
     const owner  = document.getElementById('cfg-owner').value.trim();
     const repo   = document.getElementById('cfg-repo').value.trim();
     const claude = document.getElementById('cfg-claude').value.trim();
+    const proxy  = document.getElementById('cfg-proxy').value.trim();
     if (!token || !owner || !repo || !claude) { showToast('All fields required'); return; }
-    S.settings = { ...S.settings, ghToken: token, dataOwner: owner, dataRepo: repo, claudeKey: claude };
+    S.settings = { ...S.settings, ghToken: token, dataOwner: owner, dataRepo: repo, claudeKey: claude, claudeProxyUrl: proxy };
     saveSettingsToStorage();
     showToast('Settings saved');
   });
