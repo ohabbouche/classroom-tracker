@@ -256,25 +256,34 @@ function setSavePill(state) {
 // ─── CLAUDE API ────────────────────────────────────────────────────────────────
 async function callClaude(prompt) {
   const proxyUrl = S.settings.claudeProxyUrl || 'https://claude-proxy.omar-habbouche.workers.dev/';
-  const res = await fetch(proxyUrl, {
-    method: 'POST',
-    headers: {
-      'x-api-key': S.settings.claudeKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 700,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  });
-  if (!res.ok) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: {
+        'x-api-key': S.settings.claudeKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 700,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.content[0].text.trim();
+    }
     const e = await res.json().catch(() => ({}));
-    throw new Error(e.error?.message || `Claude error ${res.status}`);
+    const msg = e.error?.message || '';
+    const isOverloaded = res.status === 529 || res.status === 503 || msg.toLowerCase().includes('overload');
+    if (isOverloaded && attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, 4000 * attempt)); // 4s, 8s, 12s
+      continue;
+    }
+    throw new Error(msg || `Claude error ${res.status}`);
   }
-  const data = await res.json();
-  return data.content[0].text.trim();
 }
 
 // ─── REPORT GENERATION ─────────────────────────────────────────────────────────
@@ -323,44 +332,72 @@ function pickTopSubjects(stats, exclude = []) {
 }
 
 function buildPrompt(student, stats, absent, topTwo, previousSubjects) {
+  const firstName = student.name.split(' ')[0];
+
   const subSummary = SUBJECTS.map(sub => {
     const st = stats[sub];
     const total = st.green + st.amber + st.red;
-    if (total === 0) return `${sub}: no lessons recorded`;
-    const perc = s => total > 0 ? Math.round((st[s] / total) * 100) : 0;
-    let line = `${sub}: ${perc('green')}% green, ${perc('amber')}% amber, ${perc('red')}% red (${total} lessons)`;
-    if (st.notes.length) line += `\n  Notes: ${st.notes.slice(0, 4).join(' | ')}`;
+    if (total === 0) return `${sub}: no data recorded — treat as average/expected performance`;
+    const breakdown = [
+      st.green > 0 ? `${st.green} green` : '',
+      st.amber > 0 ? `${st.amber} amber` : '',
+      st.red   > 0 ? `${st.red} red`     : '',
+    ].filter(Boolean).join(', ');
+    let line = `${sub}: ${breakdown} out of ${total} sessions`;
+    if (st.notes.length) line += `\n  Teacher notes: "${st.notes.slice(0, 4).join('" | "')}"`;
     return line;
   }).join('\n');
 
-  return `You are writing an end-of-term school report for a primary school student. Use warm, professional language appropriate for parents of a primary school child. Write in third person using the student's first name.
+  // Derive overall learning behaviour tone from aggregate data
+  const allScored = SUBJECTS.reduce((n, s) => n + stats[s].scored, 0);
+  const allGreen  = SUBJECTS.reduce((n, s) => n + stats[s].green, 0);
+  const allRed    = SUBJECTS.reduce((n, s) => n + stats[s].red, 0);
+  let overallTone;
+  if (allScored === 0) {
+    overallTone = 'average — no traffic light data was recorded this period';
+  } else {
+    const greenPct = allGreen / allScored;
+    const redPct   = allRed   / allScored;
+    if (greenPct >= 0.6)      overallTone = 'generally positive — majority of sessions recorded as green';
+    else if (redPct >= 0.4)   overallTone = 'mixed — a notable number of sessions recorded as red, suggesting areas needing support';
+    else                      overallTone = 'average — a typical mix of green and amber sessions';
+  }
 
-Student: ${student.name.split(' ')[0]}
+  return `You are writing an end-of-term school report for a primary school student. Write in third person using the student's first name. Use professional, measured language suitable for parents.
+
+STRICT RULES — read carefully before writing:
+1. Base every sentence ONLY on the data provided below. Do not invent, assume, or embellish details about personality, friendships, classroom behaviour, or social interactions that are not evidenced in the data.
+2. Where no traffic light data exists for a subject, treat it as average/expected performance — do not praise or criticise it.
+3. Where teacher notes exist, you may reference them specifically. Where they do not, keep statements general.
+4. Match the tone to the data. If performance is average, say so in a neutral way. Reserve positive language for genuinely good data (mostly green). If data is mixed, reflect that honestly.
+5. Do not use words like "exceptional", "outstanding", "always", "brilliant", or similar superlatives unless the data strongly supports it.
+
+Student: ${firstName}
 Days absent this period: ${absent}
+Overall learning behaviour tone (use this to calibrate Paragraph 1): ${overallTone}
 
-Subject performance (traffic light: green = achieved well, amber = developing, red = needs more support):
+Subject performance data:
 ${subSummary}
 
-Previous report featured subjects (MUST NOT use these in Paragraph 2): ${previousSubjects.length ? previousSubjects.join(', ') : 'None — this is the first report'}
-Paragraph 2 must feature: ${topTwo[0]} and ${topTwo[1]}
+Previous report featured subjects — DO NOT use these in Paragraph 2: ${previousSubjects.length ? previousSubjects.join(', ') : 'None — this is the first report'}
+Paragraph 2 must focus on: ${topTwo[0]} and ${topTwo[1]}
 
-Write exactly 3 paragraphs totalling approximately 200 words. No headings, no bullet points — flowing prose only.
+Write exactly 3 paragraphs totalling approximately 200 words. Flowing prose only — no headings or bullet points.
 
-Paragraph 1 — Social skills & learning behaviours (exactly 3 sentences):
-  • Sentence 1: Social and emotional development (how the student interacts with peers, emotional maturity)
-  • Sentence 2: Commitment to learning (engagement, enthusiasm, attitude to lessons)
-  • Sentence 3: Work ethic and independence (how they tackle tasks on their own)
-  Infer tone from performance data — mostly green suggests strong engagement; more red suggests areas needing encouragement.
+Paragraph 1 — Learning behaviours (exactly 3 sentences, based solely on the overall tone above):
+  • Sentence 1: General approach to learning this term, calibrated to the overall tone.
+  • Sentence 2: Effort and engagement, grounded in the traffic light pattern.
+  • Sentence 3: Work habits and independence — keep general if no specific data supports detail.
+  Do not mention peer relationships, friendships, or social behaviour unless a teacher note directly references it.
 
-Paragraph 2 — Knowledge areas (exactly 4 sentences: 2 per subject):
-  Write 2 sentences about ${topTwo[0]}, then 2 sentences about ${topTwo[1]}.
-  Use specific achievements or skills demonstrated. Draw on any teacher notes provided.
+Paragraph 2 — Subject knowledge (exactly 4 sentences: 2 per subject):
+  2 sentences on ${topTwo[0]}, then 2 sentences on ${topTwo[1]}.
+  Reference the actual session counts and any teacher notes. If data is limited, write that the student is working at an expected level.
 
-Paragraph 3 — Personal achievements & encouragement:
-  Highlight what makes this student unique or special.
-  End with a warm, forward-looking statement about their continued growth.
+Paragraph 3 — Encouragement (2–3 sentences):
+  A forward-looking close. Acknowledge effort or progress where the data supports it. End with an encouraging statement about the term ahead. Do not overstate achievement.
 
-Output the three paragraphs only. No preamble, no sign-off.`;
+Output the three paragraphs only.`;
 }
 
 // ─── TOAST ─────────────────────────────────────────────────────────────────────
@@ -805,22 +842,41 @@ function renderReports() {
   const start = S.reportPeriodStart;
   const end   = S.reportPeriodEnd;
 
+  // Default: all students selected
+  if (!S.selectedStudents) {
+    S.selectedStudents = new Set(S.students.map(s => s.id));
+  }
+
+  const selCount = S.selectedStudents.size;
+  const studentCheckboxes = S.students.map(st => `
+    <label class="student-check-row" style="display:flex;align-items:center;gap:10px;padding:8px 10px;
+      background:var(--bg);border-radius:8px;border:1px solid var(--border);cursor:pointer;">
+      <input type="checkbox" class="student-sel-cb" value="${esc(st.id)}"
+        ${S.selectedStudents.has(st.id) ? 'checked' : ''}
+        style="width:18px;height:18px;cursor:pointer;accent-color:var(--primary);">
+      <span style="font-size:14px;font-weight:500;">${esc(st.name)}</span>
+    </label>
+  `).join('');
+
   const savedHtml = S.savedReports?.reports
     ? S.savedReports.reports.map(r => {
         const student = S.students.find(s => s.id === r.studentId);
         if (!student) return '';
+        const isError = r.text.startsWith('[Error');
         return `
-          <div class="report-card">
+          <div class="report-card" style="${isError ? 'border-color:var(--red);' : ''}">
             <div class="report-card-header">
               <h3>${esc(student.name)}</h3>
               <div class="report-actions">
-                <button class="btn btn-ghost btn-sm" data-copy="${esc(r.studentId)}">Copy</button>
+                ${!isError ? `<button class="btn btn-ghost btn-sm" data-copy="${esc(r.studentId)}">Copy</button>` : ''}
               </div>
             </div>
-            <div class="report-text">${esc(r.text)}</div>
-            <div class="report-subjects">
-              ${r.highlightedSubjects?.map(s => `<span class="subject-tag">${esc(s)}</span>`).join('') || ''}
-            </div>
+            <div class="report-text" style="${isError ? 'color:var(--red);font-style:italic;' : ''}">${esc(r.text)}</div>
+            ${!isError && r.highlightedSubjects?.length ? `
+              <div class="report-subjects" style="margin-top:10px;">
+                <span style="font-size:11px;color:var(--text-muted);margin-right:6px;">Subjects featured:</span>
+                ${r.highlightedSubjects.map(s => `<span class="subject-tag">${esc(s)}</span>`).join('')}
+              </div>` : ''}
           </div>
         `;
       }).join('')
@@ -840,20 +896,39 @@ function renderReports() {
             <input type="date" id="period-end" value="${esc(end)}" max="${todayStr()}">
           </div>
         </div>
-        <button class="btn btn-primary" id="generate-btn">
-          Generate Reports for All Students
+        <button class="btn btn-secondary" id="load-reports-btn" style="margin-bottom:10px;">
+          Load Saved Reports for This Period
         </button>
-        <div class="generate-info">
-          Generates AI reports for all ${S.students.length} students using daily log data.
-          Previously generated reports for this period will be overwritten.
+      </div>
+
+      <div class="period-selector" style="margin-top:-4px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <label style="margin-bottom:0;">Select Students</label>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-ghost btn-sm" id="sel-all-btn">All</button>
+            <button class="btn btn-ghost btn-sm" id="sel-none-btn">None</button>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:5px;margin-bottom:12px;">
+          ${studentCheckboxes}
+        </div>
+        <button class="btn btn-primary" id="generate-btn" ${selCount === 0 ? 'disabled' : ''}>
+          Generate Reports for ${selCount === S.students.length ? 'All' : selCount} Student${selCount === 1 ? '' : 's'}
+        </button>
+        <div class="generate-info" style="margin-top:8px;">
+          Uses daily log data to write AI reports. A 2-second gap is added between each student to avoid overload errors.
         </div>
       </div>
 
       <div id="gen-progress"></div>
 
       ${savedHtml ? `
-        <div style="font-size:13px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.7px;padding:4px 0 10px;">
-          ${S.savedReports?.periodLabel ? esc(S.savedReports.periodLabel) : 'Saved Reports'}
+        <div style="font-size:13px;font-weight:700;color:var(--text-muted);text-transform:uppercase;
+          letter-spacing:0.7px;padding:4px 0 10px;margin-top:4px;">
+          ${S.savedReports?.periodLabel ? esc(S.savedReports.periodLabel) : 'Reports'}
+          <span style="font-weight:400;text-transform:none;letter-spacing:0;">
+            — generated ${S.savedReports?.generatedAt ? fmtDateShort(S.savedReports.generatedAt) : ''}
+          </span>
         </div>
         ${savedHtml}
       ` : ''}
@@ -867,6 +942,51 @@ function attachReportEvents() {
   });
   document.getElementById('period-end')?.addEventListener('change', e => {
     S.reportPeriodEnd = e.target.value;
+  });
+
+  // Load existing reports for selected period
+  document.getElementById('load-reports-btn')?.addEventListener('click', async () => {
+    const start = S.reportPeriodStart;
+    const end   = S.reportPeriodEnd;
+    if (!start || !end) { showToast('Set a start and end date first'); return; }
+    const btn = document.getElementById('load-reports-btn');
+    btn.disabled = true;
+    btn.textContent = 'Loading…';
+    try {
+      const periodKey = `${start}_${end}`;
+      await loadSavedReports(periodKey);
+      if (!S.savedReports) { showToast('No saved reports found for this period'); }
+      render();
+    } catch (e) {
+      showToast('Could not load reports: ' + e.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Load Saved Reports for This Period'; }
+    }
+  });
+
+  // Select all / none
+  document.getElementById('sel-all-btn')?.addEventListener('click', () => {
+    S.selectedStudents = new Set(S.students.map(s => s.id));
+    render();
+  });
+  document.getElementById('sel-none-btn')?.addEventListener('click', () => {
+    S.selectedStudents = new Set();
+    render();
+  });
+
+  // Individual checkboxes
+  document.querySelectorAll('.student-sel-cb').forEach(cb => {
+    cb.addEventListener('change', e => {
+      if (e.target.checked) S.selectedStudents.add(e.target.value);
+      else S.selectedStudents.delete(e.target.value);
+      // Update generate button label without full re-render
+      const genBtn = document.getElementById('generate-btn');
+      if (genBtn) {
+        const n = S.selectedStudents.size;
+        genBtn.disabled = n === 0;
+        genBtn.textContent = `Generate Reports for ${n === S.students.length ? 'All' : n} Student${n === 1 ? '' : 's'}`;
+      }
+    });
   });
 
   document.getElementById('generate-btn')?.addEventListener('click', runGeneration);
@@ -889,7 +1009,7 @@ async function runGeneration() {
 
   if (!start || !end) { showToast('Please set a start and end date'); return; }
   if (start >= end) { showToast('End date must be after start date'); return; }
-  if (S.students.length === 0) { showToast('No students to generate reports for'); return; }
+  if (!S.selectedStudents || S.selectedStudents.size === 0) { showToast('No students selected'); return; }
 
   const periodKey = `${start}_${end}`;
 
@@ -932,24 +1052,32 @@ async function runGeneration() {
     }
   } catch (e) { /* no previous reports */ }
 
+  const targetStudents = S.students.filter(s => S.selectedStudents.has(s.id));
   const results = [];
   const progressList = document.getElementById('progress-list');
+  const statusMap = {}; // studentId -> { status, cls }
+  targetStudents.forEach(s => { statusMap[s.id] = { status: 'Waiting', cls: '' }; });
 
-  for (let i = 0; i < S.students.length; i++) {
-    const student = S.students[i];
-    const pct = Math.round((i / S.students.length) * 100);
-
-    progressList.innerHTML = S.students.map((st, idx) => {
-      let status, statusCls;
-      if (idx < i) { status = 'Done ✓'; statusCls = 'done'; }
-      else if (idx === i) { status = '<span class="inline-spinner"></span>'; statusCls = ''; }
-      else { status = 'Waiting'; statusCls = ''; }
+  function renderProgressList() {
+    progressList.innerHTML = targetStudents.map(st => {
+      const { status, cls } = statusMap[st.id];
+      const width = cls === 'done' ? 100 : status.includes('spinner') ? 50 : 0;
       return `<div class="progress-row">
         <div class="progress-name">${esc(st.name.split(' ')[0])}</div>
-        <div class="progress-bar-wrap"><div class="progress-fill" style="width:${idx < i ? 100 : idx === i ? 50 : 0}%"></div></div>
-        <div class="progress-status ${statusCls}">${status}</div>
+        <div class="progress-bar-wrap"><div class="progress-fill" style="width:${width}%"></div></div>
+        <div class="progress-status ${cls}">${status}</div>
       </div>`;
     }).join('');
+  }
+
+  for (let i = 0; i < targetStudents.length; i++) {
+    const student = targetStudents[i];
+
+    statusMap[student.id] = { status: '<span class="inline-spinner"></span>', cls: '' };
+    renderProgressList();
+
+    // 2-second gap between calls to avoid overloaded errors (skip before first)
+    if (i > 0) await new Promise(r => setTimeout(r, 2000));
 
     try {
       const { stats, absent } = calcSubjectStats(student, logs);
@@ -958,25 +1086,27 @@ async function runGeneration() {
       const prompt = buildPrompt(student, stats, absent, topTwo, prevHighlighted);
       const text = await callClaude(prompt);
       results.push({ studentId: student.id, text, highlightedSubjects: topTwo });
+      statusMap[student.id] = { status: 'Done ✓', cls: 'done' };
     } catch (e) {
       results.push({ studentId: student.id, text: `[Error generating report: ${e.message}]`, highlightedSubjects: [] });
+      statusMap[student.id] = { status: 'Error', cls: 'error' };
     }
+    renderProgressList();
   }
 
-  // Mark all done
-  progressList.innerHTML = S.students.map(st => `
-    <div class="progress-row">
-      <div class="progress-name">${esc(st.name.split(' ')[0])}</div>
-      <div class="progress-bar-wrap"><div class="progress-fill" style="width:100%"></div></div>
-      <div class="progress-status done">Done ✓</div>
-    </div>
-  `).join('');
+  // Merge new results with any existing reports for other students
+  const existingReports = S.savedReports?.reports || [];
+  const newIds = new Set(results.map(r => r.studentId));
+  const merged = [
+    ...existingReports.filter(r => !newIds.has(r.studentId)),
+    ...results,
+  ];
 
   const reportData = {
     periodKey,
     periodLabel: `${fmtDateShort(start)} – ${fmtDateShort(end)}`,
     generatedAt: todayStr(),
-    reports: results,
+    reports: merged,
   };
 
   try {
