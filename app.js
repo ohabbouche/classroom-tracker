@@ -11,23 +11,30 @@ let S = {
   date: todayStr(),
   students: [],
   studentsSha: null,
+  classrooms: [],
+  classroomsSha: null,
+  activeClassroom: 'all',   // 'all' or classroom id — filters daily view
+  reportClassroom: 'all',   // 'all' or classroom id — filters reports student list
   dailyLog: null,
   logSha: null,
   logDates: null,           // Set of date strings that have log files
   overviewMonth: null,      // { year, month } for the calendar
   reportPeriodStart: '',
   reportPeriodEnd: '',
-  savedReports: null,       // loaded report data for current period
+  savedReports: null,
   savedReportsSha: null,
+  allReportPeriods: null,   // [{key, label, sha}] listed from GitHub
   settings: loadSettings(),
-  expanded: new Set(),      // studentIds currently expanded
+  expanded: new Set(),
   saveTimer: null,
   savePending: false,
+  selectedStudents: null,
 };
 
 // ─── UTILITIES ─────────────────────────────────────────────────────────────────
 function todayStr() {
-  return new Date().toISOString().split('T')[0];
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
 function parseLocalDate(str) {
@@ -54,9 +61,9 @@ function shortDayName(str) {
 }
 
 function shiftDate(str, delta) {
-  const d = parseLocalDate(str);
-  d.setDate(d.getDate() + delta);
-  return d.toISOString().split('T')[0];
+  const [y, m, d] = str.split('-').map(Number);
+  const date = new Date(y, m - 1, d + delta);
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
 }
 
 function initials(name) {
@@ -142,6 +149,24 @@ async function ghList(path) {
   return await res.json();
 }
 
+async function ghDelete(path, sha, message) {
+  const { ghToken, dataOwner, dataRepo } = S.settings;
+  const url = `https://api.github.com/repos/${dataOwner}/${dataRepo}/contents/${path}`;
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `token ${ghToken}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ message, sha }),
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    throw new Error(e.message || `GitHub delete error ${res.status}`);
+  }
+}
+
 // ─── DATA LAYER ────────────────────────────────────────────────────────────────
 async function loadStudents() {
   const { content, sha } = await ghGet('data/students.json');
@@ -158,6 +183,21 @@ async function persistStudents() {
   );
 }
 
+async function loadClassrooms() {
+  const { content, sha } = await ghGet('data/classrooms.json');
+  S.classroomsSha = sha;
+  S.classrooms = content?.classrooms || [];
+}
+
+async function persistClassrooms() {
+  S.classroomsSha = await ghPut(
+    'data/classrooms.json',
+    { classrooms: S.classrooms },
+    S.classroomsSha,
+    'Update classrooms'
+  );
+}
+
 function emptyLog(date) {
   return { date, entries: {} };
 }
@@ -166,6 +206,7 @@ function ensureEntry(studentId) {
   if (!S.dailyLog.entries[studentId]) {
     S.dailyLog.entries[studentId] = {
       absentAllDay: false,
+      behaviour: '',
       lessons: Object.fromEntries(SUBJECTS.map(s => [s, { traffic: null, note: '' }])),
     };
   }
@@ -293,11 +334,13 @@ function calcSubjectStats(student, logs) {
     stats[sub] = { green: 0, amber: 0, red: 0, notes: [], scoreTotal: 0, scored: 0 };
   }
   let absent = 0;
+  const behaviourNotes = [];
 
   for (const log of logs) {
     const entry = log.entries?.[student.id];
     if (!entry) continue;
     if (entry.absentAllDay) { absent++; continue; }
+    if (entry.behaviour?.trim()) behaviourNotes.push(entry.behaviour.trim());
     for (const sub of SUBJECTS) {
       const lesson = entry.lessons?.[sub];
       if (!lesson) continue;
@@ -315,7 +358,7 @@ function calcSubjectStats(student, logs) {
       ? stats[sub].scoreTotal / stats[sub].scored : 0;
   }
 
-  return { stats, absent };
+  return { stats, absent, behaviourNotes };
 }
 
 function pickTopSubjects(stats, exclude = []) {
@@ -331,8 +374,12 @@ function pickTopSubjects(stats, exclude = []) {
   return [all[0].subject, all[1].subject];
 }
 
-function buildPrompt(student, stats, absent, topTwo, previousSubjects) {
+function buildPrompt(student, stats, absent, topTwo, previousSubjects, behaviourNotes = []) {
   const firstName = student.name.split(' ')[0];
+  const gender = student.gender || 'other';
+  const he   = gender === 'male' ? 'He'   : gender === 'female' ? 'She'   : 'They';
+  const his  = gender === 'male' ? 'his'  : gender === 'female' ? 'her'   : 'their';
+  const him  = gender === 'male' ? 'him'  : gender === 'female' ? 'her'   : 'them';
 
   const subSummary = SUBJECTS.map(sub => {
     const st = stats[sub];
@@ -373,8 +420,10 @@ STRICT RULES — read carefully before writing:
 5. Do not use words like "exceptional", "outstanding", "always", "brilliant", or similar superlatives unless the data strongly supports it.
 
 Student: ${firstName}
+Pronouns: ${he}/${his}/${him}
 Days absent this period: ${absent}
 Overall learning behaviour tone (use this to calibrate Paragraph 1): ${overallTone}
+${behaviourNotes.length ? `Teacher behaviour notes (${behaviourNotes.length} recorded):\n${behaviourNotes.slice(0,6).map(n=>`  - "${n}"`).join('\n')}` : 'Behaviour notes: none recorded — do not comment specifically on behaviour in Paragraph 1 beyond what the performance data implies.'}
 
 Subject performance data:
 ${subSummary}
@@ -384,11 +433,11 @@ Paragraph 2 must focus on: ${topTwo[0]} and ${topTwo[1]}
 
 Write exactly 3 paragraphs totalling approximately 200 words. Flowing prose only — no headings or bullet points.
 
-Paragraph 1 — Learning behaviours (exactly 3 sentences, based solely on the overall tone above):
+Paragraph 1 — Learning behaviours (exactly 3 sentences, use ${he}/${his}/${him} pronouns throughout):
   • Sentence 1: General approach to learning this term, calibrated to the overall tone.
-  • Sentence 2: Effort and engagement, grounded in the traffic light pattern.
+  • Sentence 2: Effort and engagement, grounded in the traffic light pattern. If behaviour notes exist, you may draw on them here.
   • Sentence 3: Work habits and independence — keep general if no specific data supports detail.
-  Do not mention peer relationships, friendships, or social behaviour unless a teacher note directly references it.
+  Do not mention peer relationships, friendships, or social behaviour unless a teacher behaviour note directly references it.
 
 Paragraph 2 — Subject knowledge (exactly 4 sentences: 2 per subject):
   2 sentences on ${topTwo[0]}, then 2 sentences on ${topTwo[1]}.
@@ -559,9 +608,23 @@ function renderDaily() {
     return `<div class="loading-screen"><div class="spinner"></div><p>Loading...</p></div>`;
   }
 
-  const cards = S.students.length === 0
-    ? `<div class="empty-state"><div class="ei">👩‍🏫</div><p>No students yet.<br>Go to Settings to add students.</p></div>`
-    : S.students.map(st => renderStudentCard(st)).join('');
+  // Filter students by active classroom
+  const visibleStudents = S.activeClassroom === 'all'
+    ? S.students
+    : S.students.filter(s => s.classroomId === S.activeClassroom);
+
+  const cards = visibleStudents.length === 0
+    ? `<div class="empty-state"><div class="ei">👩‍🏫</div><p>${S.students.length === 0 ? 'No students yet.<br>Go to Settings to add students.' : 'No students in this classroom.'}</p></div>`
+    : visibleStudents.map(st => renderStudentCard(st)).join('');
+
+  const classroomTabs = S.classrooms.length > 0 ? `
+    <div class="cls-filter">
+      <button class="cls-chip${S.activeClassroom === 'all' ? ' active' : ''}" data-cls="all">All</button>
+      ${S.classrooms.map(c => `
+        <button class="cls-chip${S.activeClassroom === c.id ? ' active' : ''}" data-cls="${esc(c.id)}">${esc(c.name)}</button>
+      `).join('')}
+    </div>
+  ` : '';
 
   return `
     <div class="date-nav">
@@ -577,6 +640,7 @@ function renderDaily() {
         <button class="date-nav-btn" id="next-day">&#8250;</button>
       </div>
     </div>
+    ${classroomTabs}
     <div class="student-list" id="student-list">${cards}</div>
   `;
 }
@@ -592,6 +656,15 @@ function renderStudentCard(student) {
         const tl = entry?.lessons?.[sub]?.traffic || 'none';
         return `<span class="tl-dot ${tl}"></span>`;
       }).join('');
+
+  const behaviourVal = entry?.behaviour || '';
+  const behaviourRow = absent ? '' : `
+    <div class="lesson-row" style="border-left:3px solid var(--primary);">
+      <div class="lesson-name" style="color:var(--primary);">Overall Behaviour</div>
+      <textarea class="note-area behaviour-input" placeholder="Notes on behaviour today (optional)…"
+        data-student="${esc(student.id)}" rows="2">${esc(behaviourVal)}</textarea>
+    </div>
+  `;
 
   const lessonsHtml = absent ? '' : SUBJECTS.map(sub => {
     const lesson = entry?.lessons?.[sub] || { traffic: null, note: '' };
@@ -630,6 +703,7 @@ function renderStudentCard(student) {
           </label>
         </div>
         <div class="lessons-fields${absent ? ' lessons-disabled' : ''}" data-for="${esc(student.id)}">
+          ${behaviourRow}
           ${lessonsHtml}
         </div>
       </div>
@@ -723,13 +797,31 @@ function attachDailyEvents() {
     });
   });
 
-  // Note textareas
+  // Classroom filter chips
+  document.querySelectorAll('.cls-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.activeClassroom = btn.dataset.cls;
+      render();
+    });
+  });
+
+  // Note textareas (subject-level)
   let noteTimer = null;
-  document.querySelectorAll('.note-area').forEach(ta => {
-    ta.addEventListener('input', e => {
+  document.querySelectorAll('.note-area:not(.behaviour-input)').forEach(ta => {
+    ta.addEventListener('input', () => {
       const { student, subject } = ta.dataset;
       const entry = ensureEntry(student);
       entry.lessons[subject].note = ta.value;
+      if (noteTimer) clearTimeout(noteTimer);
+      noteTimer = setTimeout(scheduleSave, 500);
+    });
+  });
+
+  // Behaviour textareas
+  document.querySelectorAll('.behaviour-input').forEach(ta => {
+    ta.addEventListener('input', () => {
+      const entry = ensureEntry(ta.dataset.student);
+      entry.behaviour = ta.value;
       if (noteTimer) clearTimeout(noteTimer);
       noteTimer = setTimeout(scheduleSave, 500);
     });
@@ -842,9 +934,12 @@ function renderReports() {
   const start = S.reportPeriodStart;
   const end   = S.reportPeriodEnd;
 
-  // Default: all students selected
+  // Default selection: students in the active classroom (or all)
   if (!S.selectedStudents) {
-    S.selectedStudents = new Set(S.students.map(s => s.id));
+    const pool = S.reportClassroom === 'all'
+      ? S.students
+      : S.students.filter(s => s.classroomId === S.reportClassroom);
+    S.selectedStudents = new Set(pool.map(s => s.id));
   }
 
   const selCount = S.selectedStudents.size;
@@ -882,6 +977,32 @@ function renderReports() {
       }).join('')
     : '';
 
+  // Saved report periods listing
+  const periodsHtml = S.allReportPeriods && S.allReportPeriods.length > 0 ? `
+    <div class="period-selector" style="margin-bottom:0;">
+      <label>Saved Report Periods</label>
+      ${S.allReportPeriods.map(p => `
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);">
+          <div style="flex:1;font-size:14px;">${esc(p.label)}</div>
+          <button class="btn btn-ghost btn-sm" data-load-period="${esc(p.key)}">Load</button>
+          <button class="btn btn-danger btn-sm" data-del-period="${esc(p.key)}" data-del-period-sha="${esc(p.sha)}">Delete</button>
+        </div>
+      `).join('')}
+    </div>
+  ` : '';
+
+  const clsFilterHtml = S.classrooms.length > 0 ? `
+    <div style="margin-bottom:12px;">
+      <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">Filter by Classroom</div>
+      <div class="cls-filter">
+        <button class="cls-chip${S.reportClassroom === 'all' ? ' active' : ''}" data-rep-cls="all">All</button>
+        ${S.classrooms.map(c => `
+          <button class="cls-chip${S.reportClassroom === c.id ? ' active' : ''}" data-rep-cls="${esc(c.id)}">${esc(c.name)}</button>
+        `).join('')}
+      </div>
+    </div>
+  ` : '';
+
   return `
     <div class="reports-wrap">
       <div class="period-selector">
@@ -896,12 +1017,15 @@ function renderReports() {
             <input type="date" id="period-end" value="${esc(end)}" max="${todayStr()}">
           </div>
         </div>
-        <button class="btn btn-secondary" id="load-reports-btn" style="margin-bottom:10px;">
-          Load Saved Reports for This Period
-        </button>
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <button class="btn btn-secondary" id="load-reports-btn" style="flex:1;">Load Saved Reports</button>
+          <button class="btn btn-ghost" id="list-periods-btn" style="flex:1;">Browse All Periods</button>
+        </div>
       </div>
+      ${periodsHtml}
 
       <div class="period-selector" style="margin-top:-4px;">
+        ${clsFilterHtml}
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
           <label style="margin-bottom:0;">Select Students</label>
           <div style="display:flex;gap:8px;">
@@ -944,29 +1068,91 @@ function attachReportEvents() {
     S.reportPeriodEnd = e.target.value;
   });
 
-  // Load existing reports for selected period
+  // Load reports for the selected date range
   document.getElementById('load-reports-btn')?.addEventListener('click', async () => {
     const start = S.reportPeriodStart;
     const end   = S.reportPeriodEnd;
     if (!start || !end) { showToast('Set a start and end date first'); return; }
     const btn = document.getElementById('load-reports-btn');
-    btn.disabled = true;
-    btn.textContent = 'Loading…';
+    btn.disabled = true; btn.textContent = 'Loading…';
     try {
-      const periodKey = `${start}_${end}`;
-      await loadSavedReports(periodKey);
-      if (!S.savedReports) { showToast('No saved reports found for this period'); }
+      await loadSavedReports(`${start}_${end}`);
+      if (!S.savedReports) showToast('No saved reports found for this period');
       render();
-    } catch (e) {
-      showToast('Could not load reports: ' + e.message);
-    } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Load Saved Reports for This Period'; }
-    }
+    } catch (e) { showToast('Could not load: ' + e.message); }
+    finally { if (btn) { btn.disabled = false; btn.textContent = 'Load Saved Reports'; } }
+  });
+
+  // Browse / list all saved report periods
+  document.getElementById('list-periods-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('list-periods-btn');
+    btn.disabled = true; btn.textContent = 'Loading…';
+    try {
+      const files = await ghList('data/reports');
+      S.allReportPeriods = await Promise.all(
+        files.filter(f => f.name.endsWith('.json')).map(async f => {
+          const key = f.name.replace('.json', '');
+          const [startPart, endPart] = key.split('_');
+          const label = startPart && endPart ? `${fmtDateShort(startPart)} – ${fmtDateShort(endPart)}` : key;
+          return { key, label, sha: f.sha };
+        })
+      );
+      S.allReportPeriods.sort((a, b) => b.key.localeCompare(a.key));
+      render();
+    } catch (e) { showToast('Could not list periods: ' + e.message); }
+    finally { if (btn) { btn.disabled = false; btn.textContent = 'Browse All Periods'; } }
+  });
+
+  // Load a specific period from the browse list
+  document.querySelectorAll('[data-load-period]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.loadPeriod;
+      btn.disabled = true; btn.textContent = 'Loading…';
+      try {
+        await loadSavedReports(key);
+        const [s, e] = key.split('_');
+        S.reportPeriodStart = s || ''; S.reportPeriodEnd = e || '';
+        render();
+      } catch (err) { showToast('Could not load: ' + err.message); }
+      finally { if (btn) { btn.disabled = false; btn.textContent = 'Load'; } }
+    });
+  });
+
+  // Delete a report period
+  document.querySelectorAll('[data-del-period]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.delPeriod;
+      const sha = btn.dataset.delPeriodSha;
+      const [s, e] = key.split('_');
+      const label = s && e ? `${fmtDateShort(s)} – ${fmtDateShort(e)}` : key;
+      if (!confirm(`Permanently delete reports for ${label}?`)) return;
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        await ghDelete(`data/reports/${key}.json`, sha, `Delete reports ${key}`);
+        S.allReportPeriods = S.allReportPeriods?.filter(p => p.key !== key) || null;
+        if (S.savedReports?.periodKey === key) S.savedReports = null;
+        showToast('Reports deleted');
+        render();
+      } catch (err) { showToast('Delete failed: ' + err.message); }
+      finally { if (btn) { btn.disabled = false; btn.textContent = 'Delete'; } }
+    });
+  });
+
+  // Classroom filter for reports
+  document.querySelectorAll('[data-rep-cls]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.reportClassroom = btn.dataset.repCls;
+      S.selectedStudents = null; // reset selection to match new classroom
+      render();
+    });
   });
 
   // Select all / none
   document.getElementById('sel-all-btn')?.addEventListener('click', () => {
-    S.selectedStudents = new Set(S.students.map(s => s.id));
+    const pool = S.reportClassroom === 'all'
+      ? S.students
+      : S.students.filter(s => s.classroomId === S.reportClassroom);
+    S.selectedStudents = new Set(pool.map(s => s.id));
     render();
   });
   document.getElementById('sel-none-btn')?.addEventListener('click', () => {
@@ -1080,10 +1266,10 @@ async function runGeneration() {
     if (i > 0) await new Promise(r => setTimeout(r, 2000));
 
     try {
-      const { stats, absent } = calcSubjectStats(student, logs);
+      const { stats, absent, behaviourNotes } = calcSubjectStats(student, logs);
       const prevHighlighted = prevReports?.reports?.find(r => r.studentId === student.id)?.highlightedSubjects || [];
       const topTwo = pickTopSubjects(stats, prevHighlighted);
-      const prompt = buildPrompt(student, stats, absent, topTwo, prevHighlighted);
+      const prompt = buildPrompt(student, stats, absent, topTwo, prevHighlighted, behaviourNotes);
       const text = await callClaude(prompt);
       results.push({ studentId: student.id, text, highlightedSubjects: topTwo });
       statusMap[student.id] = { status: 'Done ✓', cls: 'done' };
@@ -1122,10 +1308,20 @@ async function runGeneration() {
 // ─── SETTINGS VIEW ─────────────────────────────────────────────────────────────
 function renderSettings() {
   const s = S.settings;
+
+  const genderIcon = g => g === 'male' ? '♂' : g === 'female' ? '♀' : '⚬';
+  const clsName = id => S.classrooms.find(c => c.id === id)?.name || '';
+
   const studentRows = S.students.map((st, i) => `
     <div class="student-mgmt-row" data-id="${esc(st.id)}">
       <span class="student-mgmt-num">${i + 1}</span>
-      <span class="student-mgmt-name">${esc(st.name)}</span>
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:15px;font-weight:500;">${esc(st.name)}</div>
+        <div style="font-size:12px;color:var(--text-muted);">
+          ${genderIcon(st.gender)} ${st.gender || 'unspecified'}
+          ${st.classroomId && clsName(st.classroomId) ? ` · ${esc(clsName(st.classroomId))}` : ''}
+        </div>
+      </div>
       <div style="display:flex;gap:6px;">
         <button class="icon-btn" title="Move up" data-up="${esc(st.id)}" ${i === 0 ? 'disabled style="opacity:0.3"' : ''}>↑</button>
         <button class="icon-btn" title="Move down" data-dn="${esc(st.id)}" ${i === S.students.length-1 ? 'disabled style="opacity:0.3"' : ''}>↓</button>
@@ -1134,14 +1330,50 @@ function renderSettings() {
     </div>
   `).join('');
 
+  const classroomOptions = S.classrooms.map(c =>
+    `<option value="${esc(c.id)}">${esc(c.name)}</option>`
+  ).join('');
+
+  const classroomRows = S.classrooms.map((c, i) => `
+    <div class="student-mgmt-row">
+      <span style="font-size:15px;font-weight:500;flex:1;">${esc(c.name)}</span>
+      <span style="font-size:12px;color:var(--text-muted);margin-right:8px;">
+        ${S.students.filter(s => s.classroomId === c.id).length} students
+      </span>
+      <button class="icon-btn" title="Delete classroom" data-del-cls="${esc(c.id)}" style="color:var(--red)">✕</button>
+    </div>
+  `).join('');
+
   return `
     <div class="setup-wrap">
       <div class="setup-section">
+        <div class="setup-section-title">🏫 Classrooms (${S.classrooms.length})</div>
+        ${classroomRows || '<p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">No classrooms yet.</p>'}
+        <div class="add-student-row" style="margin-top:8px;">
+          <input type="text" id="new-cls-name" placeholder="Classroom name (e.g. Year 3 Blue)" autocomplete="off">
+          <button class="btn btn-secondary btn-sm" id="add-cls-btn">Add</button>
+        </div>
+      </div>
+
+      <div class="setup-section">
         <div class="setup-section-title">👩‍🏫 Students (${S.students.length})</div>
         <div class="student-mgmt-list">${studentRows}</div>
-        <div class="add-student-row">
-          <input type="text" id="new-name" placeholder="Full name" autocomplete="off">
-          <button class="btn btn-secondary btn-sm" id="add-student-btn">Add</button>
+        <div style="display:flex;flex-direction:column;gap:7px;margin-top:8px;">
+          <input type="text" id="new-name" placeholder="Full name" autocomplete="off"
+            style="padding:11px 13px;border:1.5px solid var(--border);border-radius:10px;font-size:15px;font-family:inherit;background:var(--bg);color:var(--text);">
+          <div style="display:flex;gap:7px;">
+            <select id="new-gender" style="flex:1;padding:10px 12px;border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-family:inherit;background:var(--bg);color:var(--text);">
+              <option value="">Gender…</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="other">Other / prefer not to say</option>
+            </select>
+            <select id="new-cls" style="flex:1;padding:10px 12px;border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-family:inherit;background:var(--bg);color:var(--text);">
+              <option value="">No classroom</option>
+              ${classroomOptions}
+            </select>
+          </div>
+          <button class="btn btn-secondary" id="add-student-btn">Add Student</button>
         </div>
       </div>
 
@@ -1179,19 +1411,61 @@ function renderSettings() {
 }
 
 function attachSettingsEvents() {
+  // Add classroom
+  const addClsBtn = document.getElementById('add-cls-btn');
+  const clsInput  = document.getElementById('new-cls-name');
+  const doAddCls  = async () => {
+    const name = clsInput?.value.trim();
+    if (!name) return;
+    addClsBtn.disabled = true;
+    S.classrooms.push({ id: crypto.randomUUID(), name });
+    try {
+      await persistClassrooms();
+      clsInput.value = '';
+      showToast(`${name} created`);
+      render();
+    } catch (e) {
+      S.classrooms.pop();
+      showToast('Failed to save: ' + e.message);
+    } finally { if (addClsBtn) addClsBtn.disabled = false; }
+  };
+  addClsBtn?.addEventListener('click', doAddCls);
+  clsInput?.addEventListener('keydown', e => { if (e.key === 'Enter') doAddCls(); });
+
+  // Delete classroom
+  document.querySelectorAll('[data-del-cls]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.delCls;
+      const cls = S.classrooms.find(c => c.id === id);
+      if (!cls) return;
+      const count = S.students.filter(s => s.classroomId === id).length;
+      if (!confirm(`Delete "${cls.name}"?${count ? ` ${count} student(s) will be unassigned.` : ''}`)) return;
+      S.classrooms = S.classrooms.filter(c => c.id !== id);
+      S.students.forEach(s => { if (s.classroomId === id) s.classroomId = null; });
+      try {
+        await Promise.all([persistClassrooms(), persistStudents()]);
+        if (S.activeClassroom === id) S.activeClassroom = 'all';
+        showToast(`${cls.name} deleted`);
+        render();
+      } catch (e) { showToast('Failed: ' + e.message); }
+    });
+  });
+
   // Add student
-  const addBtn = document.getElementById('add-student-btn');
+  const addBtn   = document.getElementById('add-student-btn');
   const nameInput = document.getElementById('new-name');
 
   const doAdd = async () => {
-    const name = nameInput.value.trim();
+    const name        = nameInput.value.trim();
+    const gender      = document.getElementById('new-gender')?.value || '';
+    const classroomId = document.getElementById('new-cls')?.value || null;
     if (!name) return;
     if (S.students.some(s => s.name.toLowerCase() === name.toLowerCase())) {
       showToast('Student already exists');
       return;
     }
     addBtn.disabled = true;
-    S.students.push({ id: crypto.randomUUID(), name });
+    S.students.push({ id: crypto.randomUUID(), name, gender, classroomId: classroomId || null });
     try {
       await persistStudents();
       nameInput.value = '';
@@ -1274,7 +1548,7 @@ async function init() {
   }
 
   try {
-    await Promise.all([loadStudents(), loadDailyLog()]);
+    await Promise.all([loadStudents(), loadClassrooms(), loadDailyLog()]);
     setView('daily');
   } catch (e) {
     console.error('Init failed:', e);
