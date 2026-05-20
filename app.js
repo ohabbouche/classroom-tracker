@@ -29,6 +29,7 @@ let S = {
   saveTimer: null,
   savePending: false,
   selectedStudents: null,
+  editingStudentId: null,
 };
 
 // ─── UTILITIES ─────────────────────────────────────────────────────────────────
@@ -618,11 +619,14 @@ function renderDaily() {
     : visibleStudents.map(st => renderStudentCard(st)).join('');
 
   const classroomTabs = S.classrooms.length > 0 ? `
-    <div class="cls-filter">
-      <button class="cls-chip${S.activeClassroom === 'all' ? ' active' : ''}" data-cls="all">All</button>
-      ${S.classrooms.map(c => `
-        <button class="cls-chip${S.activeClassroom === c.id ? ' active' : ''}" data-cls="${esc(c.id)}">${esc(c.name)}</button>
-      `).join('')}
+    <div style="padding:8px 10px;background:var(--card);border-bottom:1px solid var(--border);">
+      <select id="cls-select" style="width:100%;padding:9px 12px;border:1.5px solid var(--border);border-radius:10px;
+        font-size:14px;font-weight:600;font-family:inherit;background:var(--bg);color:var(--text);">
+        <option value="all"${S.activeClassroom === 'all' ? ' selected' : ''}>All Students</option>
+        ${S.classrooms.map(c => `
+          <option value="${esc(c.id)}"${S.activeClassroom === c.id ? ' selected' : ''}>${esc(c.name)}</option>
+        `).join('')}
+      </select>
     </div>
   ` : '';
 
@@ -797,12 +801,10 @@ function attachDailyEvents() {
     });
   });
 
-  // Classroom filter chips
-  document.querySelectorAll('.cls-chip').forEach(btn => {
-    btn.addEventListener('click', () => {
-      S.activeClassroom = btn.dataset.cls;
-      render();
-    });
+  // Classroom dropdown filter
+  document.getElementById('cls-select')?.addEventListener('change', e => {
+    S.activeClassroom = e.target.value;
+    render();
   });
 
   // Note textareas (subject-level)
@@ -994,12 +996,13 @@ function renderReports() {
   const clsFilterHtml = S.classrooms.length > 0 ? `
     <div style="margin-bottom:12px;">
       <div style="font-size:12px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:6px;">Filter by Classroom</div>
-      <div class="cls-filter">
-        <button class="cls-chip${S.reportClassroom === 'all' ? ' active' : ''}" data-rep-cls="all">All</button>
+      <select id="rep-cls-select" style="width:100%;padding:9px 12px;border:1.5px solid var(--border);border-radius:10px;
+        font-size:14px;font-weight:600;font-family:inherit;background:var(--bg);color:var(--text);">
+        <option value="all"${S.reportClassroom === 'all' ? ' selected' : ''}>All Students</option>
         ${S.classrooms.map(c => `
-          <button class="cls-chip${S.reportClassroom === c.id ? ' active' : ''}" data-rep-cls="${esc(c.id)}">${esc(c.name)}</button>
+          <option value="${esc(c.id)}"${S.reportClassroom === c.id ? ' selected' : ''}>${esc(c.name)}</option>
         `).join('')}
-      </div>
+      </select>
     </div>
   ` : '';
 
@@ -1138,13 +1141,11 @@ function attachReportEvents() {
     });
   });
 
-  // Classroom filter for reports
-  document.querySelectorAll('[data-rep-cls]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      S.reportClassroom = btn.dataset.repCls;
-      S.selectedStudents = null; // reset selection to match new classroom
-      render();
-    });
+  // Classroom dropdown filter for reports
+  document.getElementById('rep-cls-select')?.addEventListener('change', e => {
+    S.reportClassroom = e.target.value;
+    S.selectedStudents = null; // reset selection to match new classroom
+    render();
   });
 
   // Select all / none
@@ -1312,23 +1313,54 @@ function renderSettings() {
   const genderIcon = g => g === 'male' ? '♂' : g === 'female' ? '♀' : '⚬';
   const clsName = id => S.classrooms.find(c => c.id === id)?.name || '';
 
-  const studentRows = S.students.map((st, i) => `
-    <div class="student-mgmt-row" data-id="${esc(st.id)}">
-      <span class="student-mgmt-num">${i + 1}</span>
-      <div style="flex:1;min-width:0;">
-        <div style="font-size:15px;font-weight:500;">${esc(st.name)}</div>
-        <div style="font-size:12px;color:var(--text-muted);">
-          ${genderIcon(st.gender)} ${st.gender || 'unspecified'}
-          ${st.classroomId && clsName(st.classroomId) ? ` · ${esc(clsName(st.classroomId))}` : ''}
+  const studentRows = S.students.map((st, i) => {
+    const isEditing = S.editingStudentId === st.id;
+    if (isEditing) {
+      return `
+        <div class="student-mgmt-row" style="flex-direction:column;align-items:stretch;gap:8px;padding:12px;" data-id="${esc(st.id)}">
+          <div style="font-size:12px;font-weight:700;color:var(--primary);text-transform:uppercase;letter-spacing:0.5px;">Editing ${esc(st.name)}</div>
+          <input type="text" id="edit-name-${esc(st.id)}" value="${esc(st.name)}"
+            style="padding:10px 12px;border:1.5px solid var(--primary);border-radius:10px;font-size:15px;font-family:inherit;background:white;color:var(--text);">
+          <div style="display:flex;gap:7px;">
+            <select id="edit-gender-${esc(st.id)}"
+              style="flex:1;padding:10px 12px;border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-family:inherit;background:var(--bg);color:var(--text);">
+              <option value="">Gender…</option>
+              <option value="male" ${st.gender === 'male' ? 'selected' : ''}>Male</option>
+              <option value="female" ${st.gender === 'female' ? 'selected' : ''}>Female</option>
+              <option value="other" ${st.gender === 'other' ? 'selected' : ''}>Other / prefer not to say</option>
+            </select>
+            <select id="edit-cls-${esc(st.id)}"
+              style="flex:1;padding:10px 12px;border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-family:inherit;background:var(--bg);color:var(--text);">
+              <option value="">No classroom</option>
+              ${S.classrooms.map(c => `<option value="${esc(c.id)}" ${st.classroomId === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div style="display:flex;gap:7px;">
+            <button class="btn btn-primary btn-sm" style="flex:1;" data-save-edit="${esc(st.id)}">Save</button>
+            <button class="btn btn-ghost btn-sm" style="flex:1;" data-cancel-edit="${esc(st.id)}">Cancel</button>
+          </div>
+        </div>
+      `;
+    }
+    return `
+      <div class="student-mgmt-row" data-id="${esc(st.id)}">
+        <span class="student-mgmt-num">${i + 1}</span>
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:15px;font-weight:500;">${esc(st.name)}</div>
+          <div style="font-size:12px;color:var(--text-muted);">
+            ${genderIcon(st.gender)} ${st.gender || 'unspecified'}
+            ${st.classroomId && clsName(st.classroomId) ? ` · ${esc(clsName(st.classroomId))}` : ''}
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="icon-btn" title="Edit student" data-edit="${esc(st.id)}">✏️</button>
+          <button class="icon-btn" title="Move up" data-up="${esc(st.id)}" ${i === 0 ? 'disabled style="opacity:0.3"' : ''}>↑</button>
+          <button class="icon-btn" title="Move down" data-dn="${esc(st.id)}" ${i === S.students.length-1 ? 'disabled style="opacity:0.3"' : ''}>↓</button>
+          <button class="icon-btn" title="Remove" data-del="${esc(st.id)}" style="color:var(--red)">✕</button>
         </div>
       </div>
-      <div style="display:flex;gap:6px;">
-        <button class="icon-btn" title="Move up" data-up="${esc(st.id)}" ${i === 0 ? 'disabled style="opacity:0.3"' : ''}>↑</button>
-        <button class="icon-btn" title="Move down" data-dn="${esc(st.id)}" ${i === S.students.length-1 ? 'disabled style="opacity:0.3"' : ''}>↓</button>
-        <button class="icon-btn" title="Remove" data-del="${esc(st.id)}" style="color:var(--red)">✕</button>
-      </div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 
   const classroomOptions = S.classrooms.map(c =>
     `<option value="${esc(c.id)}">${esc(c.name)}</option>`
@@ -1448,6 +1480,49 @@ function attachSettingsEvents() {
         showToast(`${cls.name} deleted`);
         render();
       } catch (e) { showToast('Failed: ' + e.message); }
+    });
+  });
+
+  // Edit student — open form
+  document.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.editingStudentId = btn.dataset.edit;
+      render();
+    });
+  });
+
+  // Edit student — cancel
+  document.querySelectorAll('[data-cancel-edit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.editingStudentId = null;
+      render();
+    });
+  });
+
+  // Edit student — save
+  document.querySelectorAll('[data-save-edit]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id      = btn.dataset.saveEdit;
+      const student = S.students.find(s => s.id === id);
+      if (!student) return;
+      const newName      = document.getElementById(`edit-name-${id}`)?.value.trim();
+      const newGender    = document.getElementById(`edit-gender-${id}`)?.value || '';
+      const newClassroom = document.getElementById(`edit-cls-${id}`)?.value || null;
+      if (!newName) { showToast('Name cannot be empty'); return; }
+      const prev = { name: student.name, gender: student.gender, classroomId: student.classroomId };
+      student.name = newName;
+      student.gender = newGender;
+      student.classroomId = newClassroom || null;
+      btn.disabled = true;
+      try {
+        await persistStudents();
+        S.editingStudentId = null;
+        showToast(`${newName} updated`);
+        render();
+      } catch (e) {
+        Object.assign(student, prev);
+        showToast('Failed to save: ' + e.message);
+      } finally { if (btn) btn.disabled = false; }
     });
   });
 
